@@ -51,7 +51,7 @@ from torch.utils.data import Dataset, DataLoader
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-SR           = 192000
+SR           = 22050
 N_MELS       = 64
 HOP_LENGTH   = 256
 WIN_DURATION = 0.5    # context window fed to CNN (seconds)
@@ -106,7 +106,7 @@ def extract_patch(y, sr, center_sec, duration=WIN_DURATION):
     if len(chunk) < target_len:
         chunk = np.pad(chunk, (0, target_len - len(chunk)))
     S    = librosa.feature.melspectrogram(y=chunk, sr=sr, n_mels=N_MELS,
-                                           hop_length=HOP_LENGTH, fmax=96000)
+                                           hop_length=HOP_LENGTH, fmax=sr // 2)
     S_db = librosa.power_to_db(S, ref=np.max)
     S_db = (S_db - S_db.min()) / (S_db.max() - S_db.min() + 1e-8)
     return S_db.astype(np.float32)
@@ -494,7 +494,7 @@ def save_whistle_clips(y, sr, segments, output_dir, wav_stem, padding=0.05):
         fname = os.path.join(output_dir, f"{wav_stem}__whistle_{i+1:04d}_{s:.3f}-{e:.3f}s.wav")
         sf.write(fname, chunk, sr)
         saved.append(fname)
-        print(f"  [{i+1:04d}] {s:.2f}s - {e:.2f}s  ({e-s:.2f}s)")
+        print(f"  [{i+1:04d}] {s:.2f}s – {e:.2f}s  ({e-s:.2f}s)")
     return saved
 
 
@@ -503,8 +503,7 @@ def save_whistle_clips(y, sr, segments, output_dir, wav_stem, padding=0.05):
 # ─────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Dolphin whistle detector with SEANOE pretraining")
-    parser.add_argument("--wav_dir",        default=None,   help="Folder with your own WAV recordings")
-    parser.add_argument("--wav",            default=None,   help="Single WAV file to run inference on")
+    parser.add_argument("--wav_dir",        required=True,  help="Folder with your own WAV recordings")
     parser.add_argument("--labels",         default=None,   help="Your whistles_cleaned_all.csv (not needed with --model_in)")
     parser.add_argument("--seanoe_dir",     default=None,   help="Path to seanoe dataset folder (not needed with --model_in)")
     parser.add_argument("--output_dir",     default="whistles_out")
@@ -522,84 +521,50 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    # If --wav given but no --wav_dir, use the wav's parent folder
-    if args.wav and not args.wav_dir:
-        args.wav_dir = os.path.dirname(args.wav)
+    # ── 1. Build training data ──
+    print(f"\n[1/5] Loading SEANOE training data from: {args.seanoe_dir}")
+    seanoe_patches, seanoe_targets = build_seanoe_dataset(args.seanoe_dir)
+    print(f"  SEANOE total: {len(seanoe_targets)} patches "
+          f"(whistle={sum(seanoe_targets)}, noise={len(seanoe_targets)-sum(seanoe_targets)})")
 
-    # ── 1-3. Load model or train ──
-    if args.model_in:
-        print(f"\n[1-3/5] Loading saved model: {args.model_in}")
-        model = WhistleCNN().to(device)
-        model.load_state_dict(torch.load(args.model_in, map_location=device))
-        model.eval()
-        print(f"  Model loaded — skipping training.")
-        wav_labels = {}
+    print(f"\n[2/5] Loading your own recordings: {args.labels}")
+    wav_labels = load_own_labels(args.labels, args.wav_dir, args.label_duration)
+    if not wav_labels:
+        print("  WARNING: No own recordings matched. Training on SEANOE data only.")
+        own_patches, own_targets = [], []
     else:
-        if not args.seanoe_dir or not args.labels:
-            print("ERROR: --seanoe_dir and --labels are required when training (no --model_in).")
-            return
+        print(f"  Matched {len(wav_labels)} WAV file(s):")
+        for wp, ldf in wav_labels.items():
+            print(f"    {os.path.basename(wp)}  ->  {len(ldf)} labels")
+        own_patches, own_targets = build_own_dataset(wav_labels)
 
-        print(f"\n[1/5] Loading SEANOE training data from: {args.seanoe_dir}")
-        seanoe_patches, seanoe_targets = build_seanoe_dataset(args.seanoe_dir)
-        print(f"  SEANOE total: {len(seanoe_targets)} patches "
-              f"(whistle={sum(seanoe_targets)}, noise={len(seanoe_targets)-sum(seanoe_targets)})")
+    # Combine
+    all_patches = seanoe_patches + own_patches
+    all_targets = seanoe_targets + own_targets
+    print(f"\n  Combined training set: {len(all_targets)} patches "
+          f"(whistle={sum(all_targets)}, noise={len(all_targets)-sum(all_targets)})")
 
-        print(f"\n[2/5] Loading your own recordings: {args.labels}")
-        wav_labels = load_own_labels(args.labels, args.wav_dir, args.label_duration)
-        if not wav_labels:
-            print("  WARNING: No own recordings matched. Training on SEANOE data only.")
-            own_patches, own_targets = [], []
-        else:
-            print(f"  Matched {len(wav_labels)} WAV file(s):")
-            for wp, ldf in wav_labels.items():
-                print(f"    {os.path.basename(wp)}  ->  {len(ldf)} labels")
-            own_patches, own_targets = build_own_dataset(wav_labels)
+    if sum(all_targets) == 0:
+        print("ERROR: No whistle patches found.")
+        return
 
-        all_patches = seanoe_patches + own_patches
-        all_targets = seanoe_targets + own_targets
-        print(f"\n  Combined training set: {len(all_targets)} patches "
-              f"(whistle={sum(all_targets)}, noise={len(all_targets)-sum(all_targets)})")
+    # ── 3. Train ──
+    print(f"\n[3/5] Training CNN ({args.epochs} epochs)...")
+    model = train_model(all_patches, all_targets, epochs=args.epochs, device=device)
+    if args.model_out:
+        torch.save(model.state_dict(), args.model_out)
+        print(f"  Model saved -> {args.model_out}")
 
-        if sum(all_targets) == 0:
-            print("ERROR: No whistle patches found.")
-            return
-
-        print(f"\n[3/5] Training CNN ({args.epochs} epochs)...")
-        model = train_model(all_patches, all_targets, epochs=args.epochs, device=device)
-        if args.model_out:
-            torch.save(model.state_dict(), args.model_out)
-            print(f"  Model saved -> {args.model_out}")
-
-    # ── 4 & 5. Inference ──
+    # ── 4 & 5. Inference on your own recordings ──
     all_saved, all_det_rows = [], []
 
-    # Build list of WAV files to process
-    if args.wav:
-        wav_files = [args.wav]
-        folder_mode = False
-    else:
-        wav_files = [os.path.join(args.wav_dir, f)
-                     for f in sorted(os.listdir(args.wav_dir))
-                     if f.lower().endswith((".wav", ".mp3", ".flac", ".aiff", ".ogg"))]
-        folder_mode = True
-        print(f"\n  Found {len(wav_files)} audio file(s) in {args.wav_dir}")
-
-    for wav_path in wav_files:
+    for wav_path, _ in wav_labels.items():
         wav_stem = os.path.splitext(os.path.basename(wav_path))[0]
         print(f"\n[4-5/5] Inference: {wav_stem}")
-
-        # Single file -> flat output, folder -> subfolder per wav
-        clip_dir = os.path.join(args.output_dir, wav_stem) if folder_mode else args.output_dir
-        os.makedirs(clip_dir, exist_ok=True)
-
-        try:
-            y, sr = librosa.load(wav_path, sr=SR, mono=True)
-        except Exception as e:
-            print(f"  ERROR loading {wav_path}: {e}")
-            continue
+        y, sr = librosa.load(wav_path, sr=SR, mono=True)
 
         frame_times, probs = predict_frames(model, y, sr, device=device)
-        save_frame_csv(frame_times, probs, args.threshold, clip_dir, wav_stem)
+        save_frame_csv(frame_times, probs, args.threshold, args.output_dir, wav_stem)
 
         segments = frames_to_segments(frame_times, probs,
                                        threshold=args.threshold,
@@ -607,7 +572,7 @@ def main():
                                        min_duration=args.min_duration)
         print(f"  Detected {len(segments)} whistle(s)")
 
-        saved = save_whistle_clips(y, sr, segments, clip_dir, wav_stem)
+        saved = save_whistle_clips(y, sr, segments, args.output_dir, wav_stem)
         all_saved.extend(saved)
         for s, e in segments:
             all_det_rows.append({"wav": os.path.basename(wav_path),
